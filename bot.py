@@ -3,6 +3,7 @@ import html
 import json
 import os
 import re
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -22,7 +23,8 @@ DEFAULT_CONFIG = {
     "amazon_domain": "amazon.in",
     "default_amazon_tag": "Adesh00308-21",
     "adsense_client_id": "",
-    "gemini_model": "gemini-2.5-flash"
+    "gemini_model": "gemini-2.5-flash",
+    "groq_model": "llama-3.3-70b-versatile"
 }
 
 DEFAULT_TOPICS = [
@@ -75,31 +77,62 @@ def slugify(text: str) -> str:
     return slug[:70] or f"post-{int(datetime.datetime.utcnow().timestamp())}"
 
 
-def call_gemini(prompt: str, api_key: str, model: str) -> str:
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+def call_ai(prompt: str, api_key: str, cfg: dict) -> str:
+    if api_key.startswith("gsk_"):
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        payload = {
+            "model": cfg.get("groq_model", "llama-3.3-70b-versatile"),
+            "messages": [
+                {"role": "system", "content": "You are a helpful editorial writer. Always respond with valid JSON only."},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.7,
+            "response_format": {"type": "json_object"},
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "Mozilla/5.0"
+        }
+        req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            return data["choices"][0]["message"]["content"]
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="ignore")
+            raise RuntimeError(f"Groq API Error {e.code}: {err_body}") from e
+
+    model = cfg.get("gemini_model", "gemini-2.5-flash")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.7, "responseMimeType": "application/json"},
     }
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    return data["candidates"][0]["content"]["parts"][0]["text"]
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": api_key,
+        "User-Agent": "Mozilla/5.0"
+    }
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"Gemini API Error {e.code}: {err_body}") from e
 
 
-def replenish_topics(api_key: str, model: str, existing_topics: list, published: list):
+def replenish_topics(api_key: str, cfg: dict, existing_topics: list, published: list):
     used_titles = {t["topic"] for t in existing_topics} | {p["topic"] for p in published}
     prompt = f"""Generate 15 new evergreen, 100% safe, practical buying-guide or how-to article topics in everyday tech, workspace gear, bike/commute essentials, and productivity.
 Avoid medical, legal, financial, or get-rich-quick claims.
 Do NOT repeat any of these existing topics: {json.dumps(list(used_titles)[:30])}
-Return ONLY a JSON array of objects with keys "topic" and "category"."""
-    raw = call_gemini(prompt, api_key, model)
-    new_items = json.loads(raw)
+Return ONLY a JSON object with a single key "topics" containing an array of objects with keys "topic" and "category"."""
+    raw = call_ai(prompt, api_key, cfg)
+    parsed = json.loads(raw)
+    new_items = parsed.get("topics", []) if isinstance(parsed, dict) else parsed
     if isinstance(new_items, list):
         for item in new_items:
             if isinstance(item, dict) and "topic" in item and "category" in item:
@@ -108,7 +141,7 @@ Return ONLY a JSON array of objects with keys "topic" and "category"."""
         save_json(TOPICS_FILE, existing_topics)
 
 
-def generate_article_data(topic: str, category: str, api_key: str, model: str) -> dict:
+def generate_article_data(topic: str, category: str, api_key: str, cfg: dict) -> dict:
     prompt = f"""Write a helpful, honest, human-friendly evergreen guide on the topic: "{topic}" (Category: {category}).
 
 Safety & Quality Rules:
@@ -145,7 +178,7 @@ Return ONLY valid JSON with this exact schema:
     }}
   ]
 }}"""
-    raw = call_gemini(prompt, api_key, model)
+    raw = call_ai(prompt, api_key, cfg)
     return json.loads(raw)
 
 
@@ -295,19 +328,18 @@ def main():
     if not api_key:
         raise RuntimeError("Missing GEMINI_API_KEY environment variable.")
     tag = os.environ.get("AMAZON_TAG", "").strip() or cfg.get("default_amazon_tag", "")
-    model = cfg.get("gemini_model", "gemini-2.5-flash")
 
     published_topics = {p["topic"] for p in published}
     pending = [t for t in topics if t["topic"] not in published_topics]
     if len(pending) < 2:
-        replenish_topics(api_key, model, topics, published)
+        replenish_topics(api_key, cfg, topics, published)
         topics = load_or_init_json(TOPICS_FILE, DEFAULT_TOPICS)
         pending = [t for t in topics if t["topic"] not in published_topics]
     if not pending:
         return
 
     chosen = pending[0]
-    article = generate_article_data(chosen["topic"], chosen["category"], api_key, model)
+    article = generate_article_data(chosen["topic"], chosen["category"], api_key, cfg)
     date_str = datetime.datetime.utcnow().strftime("%Y-%m-%d")
     slug = slugify(article["title"])
 
