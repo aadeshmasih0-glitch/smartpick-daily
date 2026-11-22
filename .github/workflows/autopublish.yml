@@ -1,0 +1,34 @@
+name: Evergreen AI Autopublisher
+
+on:
+  schedule:
+    - cron: '30 4 */2 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Run Evergreen AI Publisher
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          AMAZON_TAG: ${{ secrets.AMAZON_TAG }}
+        run: python bot.py
+      - name: Commit and push new article
+        run: |
+          git config user.name "Evergreen AI Bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add .
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Auto-publish evergreen article"
+            git push
+          fi
