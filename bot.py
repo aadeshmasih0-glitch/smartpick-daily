@@ -23,7 +23,6 @@ DEFAULT_CONFIG = {
     "amazon_domain": "amazon.in",
     "default_amazon_tag": "Adesh00308-21",
     "adsense_client_id": "",
-    "gemini_model": "gemini-2.5-flash",
     "groq_model": "llama-3.3-70b-versatile"
 }
 
@@ -77,51 +76,34 @@ def slugify(text: str) -> str:
     return slug[:70] or f"post-{int(datetime.datetime.utcnow().timestamp())}"
 
 
-def call_ai(prompt: str, api_key: str, cfg: dict) -> str:
-    if api_key.startswith("gsk_"):
-        url = "https://api.groq.com/openai/v1/chat/completions"
-        payload = {
-            "model": cfg.get("groq_model", "llama-3.3-70b-versatile"),
-            "messages": [
-                {"role": "system", "content": "You are a helpful editorial writer. Always respond with valid JSON only."},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0.7,
-            "response_format": {"type": "json_object"},
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-            "User-Agent": "Mozilla/5.0"
-        }
-        req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            return data["choices"][0]["message"]["content"]
-        except urllib.error.HTTPError as e:
-            err_body = e.read().decode("utf-8", errors="ignore")
-            raise RuntimeError(f"Groq API Error {e.code}: {err_body}") from e
+def clean_api_key(raw: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "", raw)
 
-    model = cfg.get("gemini_model", "gemini-2.5-flash")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+def call_ai(prompt: str, api_key: str, cfg: dict) -> str:
+    url = "https://api.groq.com/openai/v1/chat/completions"
     payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.7, "responseMimeType": "application/json"},
+        "model": cfg.get("groq_model", "llama-3.3-70b-versatile"),
+        "messages": [
+            {"role": "system", "content": "You are a helpful editorial writer. Always respond with valid JSON only."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.7,
+        "response_format": {"type": "json_object"},
     }
     headers = {
         "Content-Type": "application/json",
-        "x-goog-api-key": api_key,
+        "Authorization": f"Bearer {api_key}",
         "User-Agent": "Mozilla/5.0"
     }
     req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+        return data["choices"][0]["message"]["content"]
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"Gemini API Error {e.code}: {err_body}") from e
+        raise RuntimeError(f"Groq API Error {e.code}: {err_body}") from e
 
 
 def replenish_topics(api_key: str, cfg: dict, existing_topics: list, published: list):
@@ -324,7 +306,7 @@ def main():
     topics = load_or_init_json(TOPICS_FILE, DEFAULT_TOPICS)
     published = load_or_init_json(PUBLISHED_FILE, [])
 
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    api_key = clean_api_key(os.environ.get("GEMINI_API_KEY", ""))
     if not api_key:
         raise RuntimeError("Missing GEMINI_API_KEY environment variable.")
     tag = os.environ.get("AMAZON_TAG", "").strip() or cfg.get("default_amazon_tag", "")
