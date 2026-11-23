@@ -22,8 +22,7 @@ DEFAULT_CONFIG = {
     "author_name": "Editorial Team",
     "amazon_domain": "amazon.in",
     "default_amazon_tag": "Adesh00308-21",
-    "adsense_client_id": "",
-    "groq_model": "llama-3.3-70b-versatile"
+    "adsense_client_id": ""
 }
 
 DEFAULT_TOPICS = [
@@ -80,40 +79,95 @@ def clean_api_key(raw: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]", "", raw)
 
 
-def call_ai(prompt: str, api_key: str, cfg: dict) -> str:
+def extract_json_object(text: str) -> dict:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z]*\n?", "", cleaned)
+        cleaned = re.sub(r"\n?```$", "", cleaned).strip()
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        cleaned = cleaned[start : end + 1]
+    return json.loads(cleaned)
+
+
+def get_available_groq_models(api_key: str) -> list:
+    url = "https://api.groq.com/openai/v1/models"
+    headers = {"Authorization": f"Bearer {api_key}", "User-Agent": "Mozilla/5.0"}
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+
+    blocked = ("whisper", "tts", "orpheus", "guard", "safeguard", "prompt-guard", "vision", "compound")
+    models = []
+    for m in data.get("data", []):
+        mid = m.get("id", "")
+        low = mid.lower()
+        if mid and not any(b in low for b in blocked):
+            models.append(mid)
+
+    preferred = [
+        "openai/gpt-oss-120b",
+        "openai/gpt-oss-20b",
+        "llama-3.1-8b-instant",
+        "qwen/qwen3-32b",
+    ]
+    ordered = [m for m in preferred if m in models] + [m for m in models if m not in preferred]
+    if not ordered:
+        raise RuntimeError(f"No usable chat models found on Groq account. Raw models: {[m.get('id') for m in data.get('data', [])]}")
+    return ordered
+
+
+def call_ai(prompt: str, api_key: str) -> dict:
     url = "https://api.groq.com/openai/v1/chat/completions"
-    payload = {
-        "model": cfg.get("groq_model", "llama-3.3-70b-versatile"),
-        "messages": [
-            {"role": "system", "content": "You are a helpful editorial writer. Always respond with valid JSON only."},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.7,
-        "response_format": {"type": "json_object"},
-    }
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
-        "User-Agent": "Mozilla/5.0"
+        "User-Agent": "Mozilla/5.0",
     }
-    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        return data["choices"][0]["message"]["content"]
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"Groq API Error {e.code}: {err_body}") from e
+    models = get_available_groq_models(api_key)
+    last_error = None
+
+    for model in models[:5]:
+        for use_json_mode in (True, False):
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "You are a helpful editorial writer. Respond ONLY with a single valid JSON object and no markdown or extra text."},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.7,
+            }
+            if use_json_mode:
+                payload["response_format"] = {"type": "json_object"}
+            req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                content = data["choices"][0]["message"]["content"]
+                parsed = extract_json_object(content)
+                print(f"Generated successfully with Groq model: {model}")
+                return parsed
+            except urllib.error.HTTPError as e:
+                err_body = e.read().decode("utf-8", errors="ignore")
+                last_error = f"{model} ({e.code}): {err_body}"
+                if e.code in (400, 404, 422):
+                    continue
+                raise RuntimeError(f"Groq API Error {e.code}: {err_body}") from e
+            except Exception as e:
+                last_error = f"{model}: {e}"
+                continue
+
+    raise RuntimeError(f"All Groq models failed. Last error: {last_error}")
 
 
-def replenish_topics(api_key: str, cfg: dict, existing_topics: list, published: list):
+def replenish_topics(api_key: str, existing_topics: list, published: list):
     used_titles = {t["topic"] for t in existing_topics} | {p["topic"] for p in published}
     prompt = f"""Generate 15 new evergreen, 100% safe, practical buying-guide or how-to article topics in everyday tech, workspace gear, bike/commute essentials, and productivity.
 Avoid medical, legal, financial, or get-rich-quick claims.
 Do NOT repeat any of these existing topics: {json.dumps(list(used_titles)[:30])}
 Return ONLY a JSON object with a single key "topics" containing an array of objects with keys "topic" and "category"."""
-    raw = call_ai(prompt, api_key, cfg)
-    parsed = json.loads(raw)
+    parsed = call_ai(prompt, api_key)
     new_items = parsed.get("topics", []) if isinstance(parsed, dict) else parsed
     if isinstance(new_items, list):
         for item in new_items:
@@ -123,7 +177,7 @@ Return ONLY a JSON object with a single key "topics" containing an array of obje
         save_json(TOPICS_FILE, existing_topics)
 
 
-def generate_article_data(topic: str, category: str, api_key: str, cfg: dict) -> dict:
+def generate_article_data(topic: str, category: str, api_key: str) -> dict:
     prompt = f"""Write a helpful, honest, human-friendly evergreen guide on the topic: "{topic}" (Category: {category}).
 
 Safety & Quality Rules:
@@ -160,8 +214,7 @@ Return ONLY valid JSON with this exact schema:
     }}
   ]
 }}"""
-    raw = call_ai(prompt, api_key, cfg)
-    return json.loads(raw)
+    return call_ai(prompt, api_key)
 
 
 def build_amazon_link(keyword: str, domain: str, tag: str) -> str:
@@ -314,14 +367,14 @@ def main():
     published_topics = {p["topic"] for p in published}
     pending = [t for t in topics if t["topic"] not in published_topics]
     if len(pending) < 2:
-        replenish_topics(api_key, cfg, topics, published)
+        replenish_topics(api_key, topics, published)
         topics = load_or_init_json(TOPICS_FILE, DEFAULT_TOPICS)
         pending = [t for t in topics if t["topic"] not in published_topics]
     if not pending:
         return
 
     chosen = pending[0]
-    article = generate_article_data(chosen["topic"], chosen["category"], api_key, cfg)
+    article = generate_article_data(chosen["topic"], chosen["category"], api_key)
     date_str = datetime.datetime.utcnow().strftime("%Y-%m-%d")
     slug = slugify(article["title"])
 
